@@ -167,6 +167,199 @@ segment_definition = {
 }
 ```
 
+## 🏢 Multi-Tenant Klaviyo Setup
+
+This section covers deploying the orchestrator for agencies managing multiple Klaviyo clients via Supabase Edge Functions and Grafana.
+
+### Where to Start
+
+Follow these steps in order to get from zero to a live multi-client dashboard.
+
+---
+
+### 1. Environment Variables (`.env`)
+
+Create a file named `.env` in your project root with your actual credentials:
+
+```env
+# .env
+SUPABASE_URL="https://your-project-id.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="your-super-secret-service-role-key"
+
+KLAVIYO_API_KEY="your-klaviyo-api-key"
+KLAVIYO_API_VERSION="2024-10-15" # Check Klaviyo docs for latest version
+
+# Cron schedule (Supabase uses standard cron syntax)
+# Runs every day at 2:00 AM UTC
+CRON_SCHEDULE="0 2 * * *"
+```
+
+---
+
+### 2. Database Schema (`supabase/migrations/001_init_klaviyo_tables.sql`)
+
+Run this in your Supabase SQL Editor. It creates the raw storage table and the optimized view for Grafana.
+
+```sql
+-- 1. Create the raw metrics table
+CREATE TABLE IF NOT EXISTS daily_client_metrics (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  client_id TEXT NOT NULL,
+  client_name TEXT,
+  date DATE NOT NULL,
+  metrics JSONB NOT NULL, -- Stores the full normalized JSON payload
+  revenue NUMERIC DEFAULT 0,
+  orders_count INT DEFAULT 0,
+  unsubscribes INT DEFAULT 0,
+  opens INT DEFAULT 0,
+  clicks INT DEFAULT 0,
+  UNIQUE(client_id, date)
+);
+
+-- 2. Create an index for fast Grafana filtering
+CREATE INDEX IF NOT EXISTS idx_metrics_date_client 
+ON daily_client_metrics(date, client_id);
+
+-- 3. Create a SQL View for Grafana (Aggregated & Cleaned)
+CREATE OR REPLACE VIEW grafana_klaviyo_dashboard AS
+SELECT 
+  date,
+  client_id,
+  client_name,
+  revenue,
+  orders_count,
+  (revenue / NULLIF(orders_count, 0)) AS avg_order_value,
+  unsubscribes,
+  opens,
+  clicks,
+  (clicks::float / NULLIF(opens, 0)) AS click_through_rate,
+  (unsubscribes::float / NULLIF(opens, 0)) AS unsubscribe_rate
+FROM daily_client_metrics
+ORDER BY date DESC, client_id;
+
+-- 4. Enable Row Level Security (Optional but recommended)
+ALTER TABLE daily_client_metrics ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow service role full access" ON daily_client_metrics
+  FOR ALL USING (auth.uid() IS NOT NULL)
+  WITH CHECK (auth.uid() IS NOT NULL);
+```
+
+---
+
+### 3. Supabase Edge Function (`supabase/functions/sync-klaviyo/index.ts`)
+
+Create this file via the Supabase CLI or Dashboard. It handles the ETL logic.
+
+```typescript
+// supabase/functions/sync-klaviyo/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+serve(async (req) => {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  const apiKey = Deno.env.get("KLAVIYO_API_KEY");
+  if (!apiKey) return new Response("Missing API Key", { status: 500 });
+
+  try {
+    const response = await fetch(
+      `https://a.klaviyo.com/api/metrics?filter[client_id]=your-client-id`,
+      {
+        headers: {
+          "Authorization": `Klaviyo-API-Key ${apiKey}`,
+          "revision": Deno.env.get("KLAVIYO_API_VERSION") || "2024-10-15"
+        }
+      }
+    );
+
+    if (!response.ok) throw new Error(`Klaviyo API Error: ${response.statusText}`);
+
+    const data = await response.json();
+
+    const records = data.data.map((item: any) => ({
+      client_id: item.attributes.client_id,
+      client_name: item.attributes.name,
+      date: new Date().toISOString().split('T')[0],
+      metrics: item.attributes,
+      revenue: item.attributes.revenue || 0,
+      orders_count: item.attributes.orders_count || 0,
+      unsubscribes: item.attributes.unsubscribes || 0,
+      opens: item.attributes.opens || 0,
+      clicks: item.attributes.clicks || 0,
+    }));
+
+    const { error } = await supabase
+      .from('daily_client_metrics')
+      .upsert(records, { onConflict: 'client_id,date' });
+
+    if (error) throw error;
+
+    return new Response(JSON.stringify({ success: true, records: records.length }), {
+      headers: { "Content-Type": "application/json" },
+    });
+
+  } catch (error) {
+    console.error(error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+```
+
+---
+
+### 4. Cron Job Configuration (`supabase/config.toml`)
+
+```toml
+[functions.sync-klaviyo]
+verify_jwt = false
+```
+
+> **Note:** For production scheduling, use a GitHub Action that hits your Edge Function URL once a day, or enable the `pg_cron` extension in your Supabase Dashboard under **Database Extensions**.
+
+---
+
+### 5. Grafana Data Source Setup
+
+1. **Add Data Source**: Select **PostgreSQL**.
+2. **Connection Details:**
+   - Host: `db.your-project-id.supabase.co`
+   - Port: `5432`
+   - Database: `postgres`
+   - User: `postgres`
+   - Password: Your Supabase DB password (not the API key).
+3. **Query:** Select `grafana_klaviyo_dashboard` from the table dropdown. Use filters for `client_id` and `date`.
+
+---
+
+### How to Deploy
+
+```bash
+# 1. Initialize
+npx supabase init
+
+# 2. Link to your project
+npx supabase link --project-ref your-project-id
+
+# 3. Run migrations
+npx supabase db push
+
+# 4. Deploy the Edge Function
+npx supabase functions deploy sync-klaviyo --env-file .env
+
+# 5. Test — trigger manually via the Supabase Dashboard to verify data flow
+```
+
+Once data is flowing, build your Grafana dashboards using the `grafana_klaviyo_dashboard` view.
+
+---
+
 ## 📈 Roadmap
 
 - v1.1: Add Supabase integration for long-term storage of analytics_data_updated.csv.
