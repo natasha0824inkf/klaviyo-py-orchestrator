@@ -506,6 +506,20 @@ Add secrets to GitHub: `SUPABASE_PROJECT_ID` and `SUPABASE_ANON_KEY`.
 
 3. **Panels to build:** Revenue trend, AOV by client, engagement rates, unsubscribe tracking.
 
+**Performance note:** The `grafana_daily_metrics` view uses a subquery for `client_name`. This is fine for <100 clients. For larger scale, optimize the view to JOIN `klaviyo_clients` instead:
+
+```sql
+CREATE OR REPLACE VIEW grafana_daily_metrics AS
+SELECT 
+  m.date, m.client_id, c.client_name,
+  m.revenue, m.orders_count,
+  ROUND((m.revenue / NULLIF(m.orders_count, 0))::NUMERIC, 2) AS avg_order_value,
+  ... (rest of metrics)
+FROM daily_client_metrics m
+JOIN klaviyo_clients c USING (client_id)
+ORDER BY m.date DESC, m.client_id;
+```
+
 ---
 
 ### Deploy
