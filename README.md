@@ -167,196 +167,358 @@ segment_definition = {
 }
 ```
 
-## 🏢 Multi-Tenant Klaviyo Setup
+## 🏢 Multi-Tenant Klaviyo Sync (Production)
 
-This section covers deploying the orchestrator for agencies managing multiple Klaviyo clients via Supabase Edge Functions and Grafana.
+Real multi-tenant setup for agencies. Each client has their own Klaviyo API key stored in Supabase. The sync function loops through all clients, fetches their metrics, and stores them with proper isolation.
 
 ### Where to Start
 
-Follow these steps in order to get from zero to a live multi-client dashboard.
+1. **Database & clients table** — run the migration once
+2. **Clients config** — add your agency's clients to the `klaviyo_clients` table
+3. **Edge Function** — deploy the sync function that loops through all clients
+4. **Cron or GitHub Action** — schedule the sync to run daily
 
 ---
 
-### 1. Environment Variables (`.env`)
+### 1. Database Schema (`supabase/migrations/001_init_klaviyo_tables.sql`)
 
-Create a file named `.env` in your project root with your actual credentials:
-
-```env
-# .env
-SUPABASE_URL="https://your-project-id.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY="your-super-secret-service-role-key"
-
-KLAVIYO_API_KEY="your-klaviyo-api-key"
-KLAVIYO_API_VERSION="2024-10-15" # Check Klaviyo docs for latest version
-
-# Cron schedule (Supabase uses standard cron syntax)
-# Runs every day at 2:00 AM UTC
-CRON_SCHEDULE="0 2 * * *"
-```
-
----
-
-### 2. Database Schema (`supabase/migrations/001_init_klaviyo_tables.sql`)
-
-Run this in your Supabase SQL Editor. It creates the raw storage table and the optimized view for Grafana.
+Run this once in your Supabase SQL Editor.
 
 ```sql
--- 1. Create the raw metrics table
+-- Clients table: one row per agency client
+CREATE TABLE IF NOT EXISTS klaviyo_clients (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id TEXT NOT NULL UNIQUE,
+  client_name TEXT NOT NULL,
+  api_key TEXT NOT NULL, -- Encrypted in production
+  sync_status TEXT DEFAULT 'pending', -- pending, syncing, success, failed
+  last_synced_at TIMESTAMPTZ,
+  error_message TEXT,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Metrics: raw daily data per client
 CREATE TABLE IF NOT EXISTS daily_client_metrics (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  client_id TEXT NOT NULL,
-  client_name TEXT,
+  client_id TEXT NOT NULL REFERENCES klaviyo_clients(client_id) ON DELETE CASCADE,
   date DATE NOT NULL,
-  metrics JSONB NOT NULL, -- Stores the full normalized JSON payload
+  
+  -- Raw Klaviyo metrics
   revenue NUMERIC DEFAULT 0,
   orders_count INT DEFAULT 0,
   unsubscribes INT DEFAULT 0,
   opens INT DEFAULT 0,
   clicks INT DEFAULT 0,
+  email_sent INT DEFAULT 0,
+  bounces INT DEFAULT 0,
+  
+  -- Full payload for debugging
+  raw_payload JSONB,
+  
+  synced_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(client_id, date)
 );
 
--- 2. Create an index for fast Grafana filtering
-CREATE INDEX IF NOT EXISTS idx_metrics_date_client 
-ON daily_client_metrics(date, client_id);
+-- Sync log for debugging
+CREATE TABLE IF NOT EXISTS sync_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id TEXT NOT NULL REFERENCES klaviyo_clients(client_id) ON DELETE CASCADE,
+  sync_start TIMESTAMPTZ,
+  sync_end TIMESTAMPTZ,
+  status TEXT, -- success, failed, partial
+  records_synced INT DEFAULT 0,
+  error_details JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
 
--- 3. Create a SQL View for Grafana (Aggregated & Cleaned)
-CREATE OR REPLACE VIEW grafana_klaviyo_dashboard AS
+-- Grafana dashboard view: aggregated, clean
+CREATE OR REPLACE VIEW grafana_daily_metrics AS
 SELECT 
   date,
   client_id,
-  client_name,
+  (SELECT client_name FROM klaviyo_clients WHERE client_id = m.client_id) AS client_name,
   revenue,
   orders_count,
-  (revenue / NULLIF(orders_count, 0)) AS avg_order_value,
+  ROUND((revenue / NULLIF(orders_count, 0))::NUMERIC, 2) AS avg_order_value,
   unsubscribes,
   opens,
   clicks,
-  (clicks::float / NULLIF(opens, 0)) AS click_through_rate,
-  (unsubscribes::float / NULLIF(opens, 0)) AS unsubscribe_rate
-FROM daily_client_metrics
+  email_sent,
+  bounces,
+  ROUND((clicks::NUMERIC / NULLIF(opens, 0) * 100), 2) AS click_rate_pct,
+  ROUND((opens::NUMERIC / NULLIF(email_sent, 0) * 100), 2) AS open_rate_pct,
+  ROUND((bounces::NUMERIC / NULLIF(email_sent, 0) * 100), 2) AS bounce_rate_pct,
+  ROUND((unsubscribes::NUMERIC / NULLIF(opens, 0) * 100), 2) AS unsub_rate_pct
+FROM daily_client_metrics m
 ORDER BY date DESC, client_id;
 
--- 4. Enable Row Level Security (Optional but recommended)
-ALTER TABLE daily_client_metrics ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Allow service role full access" ON daily_client_metrics
-  FOR ALL USING (auth.uid() IS NOT NULL)
-  WITH CHECK (auth.uid() IS NOT NULL);
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_metrics_client_date ON daily_client_metrics(client_id, date);
+CREATE INDEX IF NOT EXISTS idx_sync_log_client ON sync_log(client_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clients_status ON klaviyo_clients(sync_status);
 ```
 
 ---
 
-### 3. Supabase Edge Function (`supabase/functions/sync-klaviyo/index.ts`)
+### 2. Add Your Clients
 
-Create this file via the Supabase CLI or Dashboard. It handles the ETL logic.
+Insert via the Supabase Dashboard or SQL:
+
+```sql
+INSERT INTO klaviyo_clients (client_id, client_name, api_key) VALUES
+('client_001', 'Acme Corp', 'pk_YourRealKlaviyoKeyHere'),
+('client_002', 'Widget LLC', 'pk_AnotherClientKeyHere'),
+('client_003', 'Premium Brand Co', 'pk_YetAnotherKeyHere');
+```
+
+**Production:** Encrypt the `api_key` column using Supabase Secrets or a key management service.
+
+---
+
+### 3. Edge Function (`supabase/functions/sync-klaviyo/index.ts`)
+
+This function:
+- Loops through all active clients
+- Fetches metrics from Klaviyo for each (with retry logic)
+- Stores results with isolation per client
+- Logs sync status for debugging
 
 ```typescript
-// supabase/functions/sync-klaviyo/index.ts
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const KLAVIYO_API_URL = "https://a.klaviyo.com/api/v1";
+const API_VERSION = "2024-10-15";
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+interface Client {
+  client_id: string;
+  client_name: string;
+  api_key: string;
+}
+
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = 0
+): Promise<Response> {
+  try {
+    const resp = await fetch(url, options);
+    if (resp.status === 429) {
+      if (retries < MAX_RETRIES) {
+        const wait = RETRY_DELAY_MS * Math.pow(2, retries);
+        await new Promise((r) => setTimeout(r, wait));
+        return fetchWithRetry(url, options, retries + 1);
+      }
+    }
+    return resp;
+  } catch (e) {
+    if (retries < MAX_RETRIES) {
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * Math.pow(2, retries)));
+      return fetchWithRetry(url, options, retries + 1);
+    }
+    throw e;
+  }
+}
+
+async function syncClientMetrics(
+  client: Client,
+  supabase: any,
+  yesterday: string
+): Promise<{ success: boolean; records: number; error?: string }> {
+  try {
+    // Fetch from Klaviyo's metrics endpoint
+    // Note: adjust endpoint based on your actual Klaviyo API structure
+    const metricsUrl = `${KLAVIYO_API_URL}/metrics?since=${yesterday}&until=${yesterday}`;
+    
+    const resp = await fetchWithRetry(metricsUrl, {
+      headers: {
+        "Authorization": `Klaviyo-API-Key ${client.api_key}`,
+        "revision": API_VERSION,
+      },
+    });
+
+    if (!resp.ok) {
+      const error = await resp.text();
+      throw new Error(`Klaviyo API ${resp.status}: ${error}`);
+    }
+
+    const data = await resp.json();
+    if (!data.data || data.data.length === 0) {
+      return { success: true, records: 0 };
+    }
+
+    // Transform and batch insert
+    const records = data.data.map((item: any) => ({
+      client_id: client.client_id,
+      date: yesterday,
+      revenue: parseFloat(item.revenue) || 0,
+      orders_count: parseInt(item.orders_count) || 0,
+      unsubscribes: parseInt(item.unsubscribes) || 0,
+      opens: parseInt(item.opens) || 0,
+      clicks: parseInt(item.clicks) || 0,
+      email_sent: parseInt(item.email_sent) || 0,
+      bounces: parseInt(item.bounces) || 0,
+      raw_payload: item,
+    }));
+
+    // Upsert with conflict handling
+    const { error: upsertError } = await supabase
+      .from("daily_client_metrics")
+      .upsert(records, { onConflict: "client_id,date" });
+
+    if (upsertError) throw upsertError;
+
+    return { success: true, records: records.length };
+  } catch (error) {
+    return {
+      success: false,
+      records: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 serve(async (req) => {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabase = createClient(supabaseUrl, supabaseKey);
 
-  const apiKey = Deno.env.get("KLAVIYO_API_KEY");
-  if (!apiKey) return new Response("Missing API Key", { status: 500 });
+  const syncStart = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const dateStr = yesterday.toISOString().split("T")[0];
 
   try {
-    const response = await fetch(
-      `https://a.klaviyo.com/api/metrics?filter[client_id]=your-client-id`,
-      {
-        headers: {
-          "Authorization": `Klaviyo-API-Key ${apiKey}`,
-          "revision": Deno.env.get("KLAVIYO_API_VERSION") || "2024-10-15"
-        }
-      }
-    );
+    // Fetch all active clients
+    const { data: clients, error: clientsError } = await supabase
+      .from("klaviyo_clients")
+      .select("client_id,client_name,api_key")
+      .eq("sync_status", "pending");
 
-    if (!response.ok) throw new Error(`Klaviyo API Error: ${response.statusText}`);
+    if (clientsError) throw clientsError;
+    if (!clients || clients.length === 0) {
+      return new Response(
+        JSON.stringify({ message: "No clients to sync", total: 0 }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
 
-    const data = await response.json();
+    // Sync each client
+    const results: any[] = [];
+    for (const client of clients as Client[]) {
+      const result = await syncClientMetrics(client, supabase, dateStr);
+      results.push({ client_id: client.client_id, ...result });
 
-    const records = data.data.map((item: any) => ({
-      client_id: item.attributes.client_id,
-      client_name: item.attributes.name,
-      date: new Date().toISOString().split('T')[0],
-      metrics: item.attributes,
-      revenue: item.attributes.revenue || 0,
-      orders_count: item.attributes.orders_count || 0,
-      unsubscribes: item.attributes.unsubscribes || 0,
-      opens: item.attributes.opens || 0,
-      clicks: item.attributes.clicks || 0,
-    }));
+      // Log to sync_log table
+      const syncEnd = new Date();
+      await supabase.from("sync_log").insert({
+        client_id: client.client_id,
+        sync_start: syncStart,
+        sync_end: syncEnd,
+        status: result.success ? "success" : "failed",
+        records_synced: result.records,
+        error_details: result.error ? { message: result.error } : null,
+      });
 
-    const { error } = await supabase
-      .from('daily_client_metrics')
-      .upsert(records, { onConflict: 'client_id,date' });
+      // Update client status
+      await supabase
+        .from("klaviyo_clients")
+        .update({
+          sync_status: result.success ? "success" : "failed",
+          last_synced_at: new Date(),
+          error_message: result.error || null,
+        })
+        .eq("client_id", client.client_id);
+    }
 
-    if (error) throw error;
-
-    return new Response(JSON.stringify({ success: true, records: records.length }), {
+    const totalRecords = results.reduce((sum, r) => sum + r.records, 0);
+    return new Response(JSON.stringify({ success: true, results, totalRecords }), {
       headers: { "Content-Type": "application/json" },
     });
-
   } catch (error) {
-    console.error(error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    console.error("Sync failed:", error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
 });
 ```
 
 ---
 
-### 4. Cron Job Configuration (`supabase/config.toml`)
+### 4. Cron Trigger (GitHub Action)
 
-```toml
-[functions.sync-klaviyo]
-verify_jwt = false
+Create `.github/workflows/sync-klaviyo.yml`:
+
+```yaml
+name: Daily Klaviyo Sync
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM UTC daily
+  workflow_dispatch:      # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Supabase sync function
+        run: |
+          curl -X POST \
+            https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co/functions/v1/sync-klaviyo \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            --fail-with-body
 ```
 
-> **Note:** For production scheduling, use a GitHub Action that hits your Edge Function URL once a day, or enable the `pg_cron` extension in your Supabase Dashboard under **Database Extensions**.
+Add secrets to GitHub: `SUPABASE_PROJECT_ID` and `SUPABASE_ANON_KEY`.
 
 ---
 
-### 5. Grafana Data Source Setup
+### 5. Grafana Setup
 
-1. **Add Data Source**: Select **PostgreSQL**.
-2. **Connection Details:**
-   - Host: `db.your-project-id.supabase.co`
-   - Port: `5432`
+1. **PostgreSQL Data Source:**
+   - Host: `db.your-project-id.supabase.co:5432`
    - Database: `postgres`
-   - User: `postgres`
-   - Password: Your Supabase DB password (not the API key).
-3. **Query:** Select `grafana_klaviyo_dashboard` from the table dropdown. Use filters for `client_id` and `date`.
+   - User: `postgres` (or read-only user)
+   - SSL: Require
+
+2. **Sample Grafana Query:**
+   ```sql
+   SELECT 
+     date,
+     client_name,
+     revenue,
+     avg_order_value,
+     click_rate_pct,
+     open_rate_pct
+   FROM grafana_daily_metrics
+   WHERE date >= now()::date - 30
+   ORDER BY date DESC
+   ```
+
+3. **Panels to build:** Revenue trend, AOV by client, engagement rates, unsubscribe tracking.
 
 ---
 
-### How to Deploy
+### Deploy
 
 ```bash
-# 1. Initialize
 npx supabase init
-
-# 2. Link to your project
 npx supabase link --project-ref your-project-id
-
-# 3. Run migrations
 npx supabase db push
-
-# 4. Deploy the Edge Function
-npx supabase functions deploy sync-klaviyo --env-file .env
-
-# 5. Test — trigger manually via the Supabase Dashboard to verify data flow
+npx supabase functions deploy sync-klaviyo
+npx supabase secrets set KLAVIYO_API_VERSION=2024-10-15
 ```
 
-Once data is flowing, build your Grafana dashboards using the `grafana_klaviyo_dashboard` view.
+Test manually in the Supabase Dashboard under **Functions** → **sync-klaviyo** → **Invoke**.
 
 ---
 
