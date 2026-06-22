@@ -37,6 +37,7 @@ graph LR
     C -->|CPC Spike| E[Slack Alert]
     D --> F[Live Klaviyo Segments]
     F --> G[Automated Flows]
+
 ---
 📦 Included Data Modules
 This repo is pre-configured to handle the datasets from the Business Intelligence - Python for Marketing task:
