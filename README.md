@@ -160,4 +160,209 @@ v1.3: Real-time Grafana dashboard auto-generation.
 🤝 Contributing
 Pull requests are welcome! If you have a new KPI metric or a better way to handle handle_missing_data.ipynb logic, open an issue or submit a PR.
 
+Data Architecture Plan
+
+Here is the complete data architecture plan.
+
+### 1. Database Schema (Supabase/PostgreSQL)
+
+```sql
+CREATE TABLE users (
+  user_id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  first_name TEXT,
+  last_name TEXT,
+  country TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  total_orders INT DEFAULT 0,
+  total_revenue NUMERIC DEFAULT 0,
+  avg_order_value NUMERIC,
+  last_open_date DATE,
+  last_click_date DATE,
+  churn_risk_score FLOAT DEFAULT 0.0,
+  segment_tags TEXT[]
+);
+
+CREATE TABLE campaigns (
+  campaign_id TEXT PRIMARY KEY,
+  name TEXT,
+  channel TEXT,
+  status TEXT,
+  budget NUMERIC,
+  spent NUMERIC,
+  impressions INT,
+  clicks INT,
+  ctr FLOAT DEFAULT 0.0,
+  cpc NUMERIC DEFAULT 0.0,
+  last_updated TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE user_events (
+  event_id BIGSERIAL PRIMARY KEY,
+  user_id TEXT REFERENCES users(user_id),
+  event_type TEXT,
+  event_data JSONB,
+  occurred_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_events_time ON user_events (user_id, occurred_at);
+
+CREATE TABLE klaviyo_sync_log (
+  log_id BIGSERIAL PRIMARY KEY,
+  segment_name TEXT,
+  sync_status TEXT,
+  records_synced INT,
+  error_message TEXT,
+  synced_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE VIEW v_churn_risk AS
+SELECT 
+  user_id,
+  CASE 
+    WHEN last_open_date < NOW() - INTERVAL '30 days' THEN 0.9
+    WHEN last_click_date < NOW() - INTERVAL '14 days' THEN 0.7
+    WHEN avg_order_value < 10 THEN 0.5
+    ELSE 0.1
+  END as risk_score
+FROM users;
+```
+
+### 2. Python Orchestration Script
+
+```python
+import pandas as pd
+import psycopg2
+import requests
+import os
+from datetime import datetime
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+KLAVIYO_API_KEY = os.getenv("KLAVIYO_API_KEY")
+KLAVIYO_API_URL = "https://a.klaviyo.com/api/v2"
+
+def load_data_to_supabase(df, table_name, conn):
+    cursor = conn.cursor()
+    for _, row in df.iterrows():
+        columns = ', '.join(row.index)
+        placeholders = ', '.join(['%s'] * len(row))
+        values = list(row)
+        sql = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders}) ON CONFLICT (user_id) DO UPDATE SET {', '.join([f'{k}=EXCLUDED.{k}' for k in row.index if k != 'user_id'])}"
+        try:
+            cursor.execute(sql, values)
+        except Exception as e:
+            print(f"Error inserting row: {e}")
+    conn.commit()
+    cursor.close()
+
+def sync_churn_segment(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM v_churn_risk WHERE risk_score > 0.7")
+    users = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+
+    if not users:
+        return
+
+    payload = {
+        "data": {
+            "type": "segment",
+            "attributes": {
+                "name": f"High Churn Risk - {datetime.now().strftime('%Y-%m-%d')}",
+                "definition": {
+                    "condition_groups": [
+                        {
+                            "conditions": [
+                                {"type": "profile-property", "field": "user_id", "operator": "in", "value": users}
+                            ],
+                            "logic": "OR"
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    headers = {
+        "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+        "Content-Type": "application/json",
+        "Klaviyo-Version": "2024-08-15"
+    }
+
+    response = requests.post(f"{KLAVIYO_API_URL}/segment", json=payload, headers=headers)
+    
+    log_entry = {
+        "segment_name": "High Churn Risk",
+        "sync_status": "success" if response.status_code == 201 else "failed",
+        "records_synced": len(users),
+        "error_message": response.text if response.status_code != 201 else None
+    }
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO klaviyo_sync_log (segment_name, sync_status, records_synced, error_message) VALUES (%s, %s, %s, %s)",
+        (log_entry["segment_name"], log_entry["sync_status"], log_entry["records_synced"], log_entry["error_message"])
+    )
+    conn.commit()
+    cursor.close()
+
+def main():
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    
+    # Load Users
+    df_users = pd.read_csv("data/email_open_rates.csv")
+    load_data_to_supabase(df_users, "users", conn)
+
+    # Load Campaigns
+    df_campaigns = pd.read_csv("data/campaigns.csv")
+    load_data_to_supabase(df_campaigns, "campaigns", conn)
+
+    # Sync Segments
+    sync_churn_segment(conn)
+    
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+### 3. Grafana Dashboard Queries
+
+**Panel 1: Churn Risk Count**
+```sql
+SELECT count(*) as churn_count
+FROM users
+WHERE churn_risk_score > 0.7;
+```
+
+**Panel 2: CPC Trend (7-Day Rolling Average)**
+```sql
+SELECT 
+  DATE_TRUNC('day', last_updated) as day,
+  AVG(cpc) OVER (ORDER BY DATE_TRUNC('day', last_updated) ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as rolling_cpc
+FROM campaigns
+WHERE channel = 'facebook';
+```
+
+**Panel 3: Email Open Rate by Day**
+```sql
+SELECT 
+  DATE_TRUNC('day', occurred_at) as day,
+  count(*) as opens
+FROM user_events
+WHERE event_type = 'email_open'
+GROUP BY day
+ORDER BY day;
+```
+
+### 4. Environment Variables (.env)
+
+```env
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-anon-key
+DATABASE_URL=postgresql://postgres:password@db.your-project.supabase.co:5432/postgres
+KLAVIYO_API_KEY=your-klaviyo-private-api-key
+```
+
 See CONTRIBUTING.md for setup instructions.
