@@ -1,8 +1,9 @@
 # klaviyo-py-orchestrator
 The Concept 
 
-**A Python CLI tool that reads your marketing CSVs, applies your custom KPI logic (Churn Risk, CPC Efficiency), and automatically creates or updates Klaviyo Segments via the API. It essentially turns your .ipynb analysis into a production-grade automation engine
-**---
+**A Python CLI tool that reads your marketing CSVs, applies your custom KPI logic (Churn Risk, CPC Efficiency), and automatically creates or updates Klaviyo Segments via the API. It essentially turns your .ipynb analysis into a production-grade automation engine**
+
+---
 # Klaviyo Py-Orchestrator
 
 > **Turn static marketing CSVs into live, revenue-generating Klaviyo segments.**
@@ -28,7 +29,7 @@ Most agencies analyze data in silos, eg:
 
 ## 🏗️ Architecture
 
-```mermaid```
+```mermaid
 graph LR
     A[Raw CSVs] --> B(Python ETL Engine)
     B --> C{KPI Logic}
@@ -37,10 +38,10 @@ graph LR
     C -->|CPC Spike| E[Slack Alert]
     D --> F[Live Klaviyo Segments]
     F --> G[Automated Flows]
+```
 
+## 📦 Included Data Modules
 
-
-📦 Included Data Modules
 This repo is pre-configured to handle the datasets from the Business Intelligence - Python for Marketing task:
 
 Churn Detector
@@ -55,7 +56,9 @@ Groups users by "Bargain Hunter" vs. "Premium Seeker".
 Time-Series Resample
 resample_the_time_series.ipynb
 Smooths daily noise to predict next-week revenue.
-🚀 Quick Start
+
+## 🚀 Quick Start
+
 1. Installation
 bash
 
@@ -84,25 +87,30 @@ python main.py --mode sync --segments churn,high_aov
 
 # Generate a visual report only
 python main.py --mode report --format pdf
-🔧 Key Features
-🧠 Dynamic Segment Creation
+
+## 🔧 Key Features
+
+### 🧠 Dynamic Segment Creation
 Leverages the Klaviyo Segments API to build complex condition groups automatically.
 
 Example: "Users who visited /pricing in the last 7 days, have an email open rate < 10%, and are located in the EU."
 Code: Uses profile-property, profile-metric, and profile-region condition types dynamically.
-📊 Custom KPI Calculation
+
+### 📊 Custom KPI Calculation
+
 Integrates your custom Jupyter logic into a production script:
 
 calculate_ctr.ipynb → Real-time CTR alerts.
 handle_outliers.ipynb → Bot traffic filtering before segment creation.
 create_a_rolling_average_plot.ipynb → Trend smoothing for decision making.
-🤖 Automated Alerts
+
+### 🤖 Automated Alerts
+
 If a campaign's CPC spikes by >20% (detected via plot_cpc_data.ipynb logic), the tool triggers a webhook to Slack or sends a personalized alert email via send_personalized_emails.ipynb.
 
-📂 Project Structure
-text
+## 📂 Project Structure
 
-Copy
+```
 klaviyo-py-orchestrator/
 ├── data/
 │   ├── marketing_data.csv
@@ -120,7 +128,10 @@ klaviyo-py-orchestrator/
 ├── .env.example
 ├── main.py
 └── README.md
-🧪 API Integration Details
+```
+
+## 🧪 API Integration Details
+
 This tool uses the Klaviyo Segments API to create dynamic definitions.
 
 Example: Creating a "High Risk Churn" Segment The tool constructs a JSON definition combining:
@@ -154,11 +165,16 @@ segment_definition = {
         }
     }
 }
-📈 Roadmap
-v1.1: Add Supabase integration for long-term storage of analytics_data_updated.csv.
-v1.2: Integrate seo-gtm-brain for content gap analysis.
-v1.3: Real-time Grafana dashboard auto-generation.
-🤝 Contributing
+```
+
+## 📈 Roadmap
+
+- v1.1: Add Supabase integration for long-term storage of analytics_data_updated.csv.
+- v1.2: Integrate seo-gtm-brain for content gap analysis.
+- v1.3: Real-time Grafana dashboard auto-generation.
+
+## 🤝 Contributing
+
 Pull requests are welcome! If you have a new KPI metric or a better way to handle handle_missing_data.ipynb logic, open an issue or submit a PR.
 
 Data Architecture Plan
