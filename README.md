@@ -28,7 +28,7 @@ Most agencies analyze data in silos, eg:
 
 ## 🏗️ Architecture
 
-```mermaid
+```mermaid```
 graph LR
     A[Raw CSVs] --> B(Python ETL Engine)
     B --> C{KPI Logic}
