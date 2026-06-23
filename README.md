@@ -1,9 +1,3 @@
-# klaviyo-py-orchestrator
-The Concept 
-
-**A Python CLI tool that reads your marketing CSVs, applies your custom KPI logic (Churn Risk, CPC Efficiency), and automatically creates or updates Klaviyo Segments via the API. It essentially turns your .ipynb analysis into a production-grade automation engine**
-
----
 # Klaviyo Py-Orchestrator
 
 > **Turn static marketing CSVs into live, revenue-generating Klaviyo segments.**
@@ -18,7 +12,7 @@ Built for the modern agency stack: **Python • Pandas • Klaviyo API • Supab
 
 ---
 
-##  Idea behind this
+## 💡 Idea Behind This
 
 Most agencies analyze data in silos, eg:
 1.  Export CSVs from Ads/Website.
@@ -44,49 +38,43 @@ graph LR
 
 This repo is pre-configured to handle the datasets from the Business Intelligence - Python for Marketing task:
 
-Churn Detector
-email_open_rates.csv, users.csv
-Calculates 30-day engagement decay & triggers "Win-back" segment.
-Ad Efficiency
-campaigns.csv, plot_cpc_data.ipynb
-Flags campaigns with CPC > $X and Bounce Rate > Y%.
-Behavioral Clusters
-pages_visited.csv, pages_clicked.csv
-Groups users by "Bargain Hunter" vs. "Premium Seeker".
-Time-Series Resample
-resample_the_time_series.ipynb
-Smooths daily noise to predict next-week revenue.
+| Module | Files | What it does |
+|--------|-------|--------------|
+| **Churn Detector** | `email_open_rates.csv`, `users.csv` | Calculates 30-day engagement decay, triggers "Win-back" segment |
+| **Ad Efficiency** | `campaigns.csv`, `plot_cpc_data.ipynb` | Flags campaigns with CPC > threshold and Bounce Rate > threshold |
+| **Behavioral Clusters** | `pages_visited.csv`, `pages_clicked.csv` | Groups users by "Bargain Hunter" vs "Premium Seeker" |
+| **Time-Series Resample** | `resample_the_time_series.ipynb` | Smooths daily noise to predict next-week revenue |
 
 ## 🚀 Quick Start
 
-1. Installation
-bash
+**1. Installation**
 
-Copy
+```bash
 git clone https://github.com/natasha0824inkf/klaviyo-py-orchestrator.git
 cd klaviyo-py-orchestrator
 pip install -r requirements.txt
-2. Configuration
-Set your environment variables in a .env file:
+```
 
-env
+**2. Configuration**
 
-Copy
+Create a `.env` file in the project root:
+
+```env
 KLAVIYO_API_KEY=your_secret_api_key
 KLAVIYO_PRIVATE_API_KEY=your_private_key
 DATA_DIR=./data
 OUTPUT_DIR=./output
-3. Run the Engine
-Execute the main pipeline:
+```
 
-bash
+**3. Run the Engine**
 
-Copy
+```bash
 # Analyze data and sync segments
 python main.py --mode sync --segments churn,high_aov
 
 # Generate a visual report only
 python main.py --mode report --format pdf
+```
 
 ## 🔧 Key Features
 
@@ -100,9 +88,9 @@ Code: Uses profile-property, profile-metric, and profile-region condition types 
 
 Integrates your custom Jupyter logic into a production script:
 
-calculate_ctr.ipynb → Real-time CTR alerts.
-handle_outliers.ipynb → Bot traffic filtering before segment creation.
-create_a_rolling_average_plot.ipynb → Trend smoothing for decision making.
+- `calculate_ctr.ipynb` → Real-time CTR alerts
+- `handle_outliers.ipynb` → Bot traffic filtering before segment creation
+- `create_a_rolling_average_plot.ipynb` → Trend smoothing for decision making
 
 ### 🤖 Automated Alerts
 
@@ -134,15 +122,15 @@ klaviyo-py-orchestrator/
 
 This tool uses the Klaviyo Segments API to create dynamic definitions.
 
-Example: Creating a "High Risk Churn" Segment The tool constructs a JSON definition combining:
+**Example: Creating a "High Risk Churn" Segment**
 
-profile-metric: "Fulfilled Order" count < 1 in last 90 days.
-profile-property: "Email Open Rate" < 5%.
-profile-group-membership: Not in "VIP List".
-python
+The tool constructs a JSON payload combining:
+- `profile-metric`: "Fulfilled Order" count < 1 in last 90 days
+- `profile-property`: "Email Open Rate" < 5%
+- `profile-group-membership`: Not in "VIP List"
 
-Copy
-# Pseudo-code from src/klaviyo_connector.py
+```python
+# src/klaviyo_connector.py
 segment_definition = {
     "type": "segment",
     "attributes": {
@@ -536,6 +524,28 @@ Test manually in the Supabase Dashboard under **Functions** → **sync-klaviyo**
 
 ---
 
+## 💡 Alternative: Drop Supabase, Use Neon + Python
+
+If you already have data in Supabase and want to keep it, ignore this. But if you're starting fresh or frustrated with Supabase overhead — this stack is simpler for the Klaviyo → Grafana flow.
+
+**The idea:** Supabase is overkill here. You're not using auth, realtime, or storage — just Postgres + a cron job. Neon gives you serverless Postgres with a plain connection string and nothing else to manage.
+
+```
+Klaviyo API → Python script (GitHub Action) → Neon Postgres → Grafana
+```
+
+**Why it's cleaner:**
+- No SDK, no edge functions, no Supabase dashboard to fight
+- Same schema, same Grafana queries — just a different `DATABASE_URL`
+- Python script replaces the TypeScript Edge Function (you already have the logic in this repo)
+- GitHub Action handles the cron (same as the Supabase approach anyway)
+
+**To migrate:** Change `DATABASE_URL` in your `.env` to your Neon connection string. The schema and Python sync script work as-is against any Postgres.
+
+> **Keep Supabase if:** you already have clients or users data there and don't want to migrate. The tables in the Multi-Tenant section above were designed to coexist with existing Supabase tables.
+
+---
+
 ## 📈 Roadmap
 
 - v1.1: Add Supabase integration for long-term storage of analytics_data_updated.csv.
@@ -546,9 +556,7 @@ Test manually in the Supabase Dashboard under **Functions** → **sync-klaviyo**
 
 Pull requests are welcome! If you have a new KPI metric or a better way to handle handle_missing_data.ipynb logic, open an issue or submit a PR.
 
-Data Architecture Plan
-
-Here is the complete data architecture plan.
+## 🗄️ Data Architecture Plan
 
 ### 1. Database Schema (Supabase/PostgreSQL)
 
